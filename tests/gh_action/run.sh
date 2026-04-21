@@ -33,7 +33,7 @@ create_example_project() {
     git config --local user.name "developer"
     git config --local commit.gpgSign false
     git config --local tag.gpgSign false
-    git remote add origin "https://github.com/python-semantic-release/example-project.git"
+    git remote add origin "https://example.invalid/example-project.git"
 
     # Create initial commit and tag
     git add .

@@ -1,9 +1,0 @@
-tests
-build
-dist
-docs
-htmlcov
-.git
-.mypy_cache
-.pytest_cache
-.tox

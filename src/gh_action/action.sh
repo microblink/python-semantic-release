@@ -2,14 +2,7 @@
 
 set -e
 
-WORKSPACE_DIR="$(pwd)"
-
-explicit_run_cmd() {
-  local cmd=""
-  cmd="$(printf '%s' "$*" | sed 's/^ *//g' | sed 's/ *$//g')"
-  printf '%s\n' "$> $cmd"
-  eval "$cmd"
-}
+WORKSPACE_DIR="${GITHUB_WORKSPACE:-$(pwd)}"
 
 # Convert "true"/"false" into command line args, returns "" if not defined
 eval_boolean_action_input() {
@@ -51,19 +44,20 @@ eval_string_input() {
 	printf '%s' "${if_defined/\%s/$value}"
 }
 
-# Capture UID and GID of the external filesystem
 if [ ! -f "$WORKSPACE_DIR/.git/HEAD" ]; then
 	echo "::error:: .git/HEAD file not found. Ensure you are in a valid git repository."
 	exit 1
 fi
 
-EXT_HOST_UID="$(stat -c '%u' "$WORKSPACE_DIR/.git/HEAD")"
-EXT_HOST_GID="$(stat -c '%g' "$WORKSPACE_DIR/.git/HEAD")"
-
-if [ -z "$EXT_HOST_UID" ] || [ -z "$EXT_HOST_GID" ]; then
-	echo "Error: Unable to determine external filesystem UID/GID from .git/HEAD"
+# This action requires uv on PATH; provision it in the caller workflow (e.g.
+# via astral-sh/setup-uv) before invoking the action. uv itself will provision
+# Python when needed.
+if ! command -v uv >/dev/null 2>&1; then
+	echo "::error::'uv' not found on PATH. This action requires uv; provision it in your workflow before invoking the action."
 	exit 1
 fi
+
+PSR_UVX=(uvx --from "python-semantic-release==10.5.3" semantic-release)
 
 # Convert inputs to command line arguments
 ROOT_OPTIONS=()
@@ -94,15 +88,12 @@ fi
 ROOT_OPTIONS+=("$(eval_boolean_action_input "strict" "$INPUT_STRICT" "--strict" "")") || exit 1
 ROOT_OPTIONS+=("$(eval_boolean_action_input "no_operation_mode" "$INPUT_NO_OPERATION_MODE" "--noop" "")") || exit 1
 
-ARGS=()
+# Flags that define the shape of the next version. These are shared between
+# both passes when we gate on uv.lock below, so that pass 1 bumps the same
+# version pass 2 is going to release.
+VERSION_SHAPE_ARGS=()
 # v10 Breaking change as prerelease should be as_prerelease to match
-ARGS+=("$(eval_boolean_action_input "prerelease" "$INPUT_PRERELEASE" "--as-prerelease" "")") || exit 1
-ARGS+=("$(eval_boolean_action_input "commit" "$INPUT_COMMIT" "--commit" "--no-commit")") || exit 1
-ARGS+=("$(eval_boolean_action_input "tag" "$INPUT_TAG" "--tag" "--no-tag")") || exit 1
-ARGS+=("$(eval_boolean_action_input "push" "$INPUT_PUSH" "--push" "--no-push")") || exit 1
-ARGS+=("$(eval_boolean_action_input "changelog" "$INPUT_CHANGELOG" "--changelog" "--no-changelog")") || exit 1
-ARGS+=("$(eval_boolean_action_input "vcs_release" "$INPUT_VCS_RELEASE" "--vcs-release" "--no-vcs-release")") || exit 1
-ARGS+=("$(eval_boolean_action_input "build" "$INPUT_BUILD" "" "--skip-build")") || exit 1
+VERSION_SHAPE_ARGS+=("$(eval_boolean_action_input "prerelease" "$INPUT_PRERELEASE" "--as-prerelease" "")") || exit 1
 
 # Handle --patch, --minor, --major
 # https://stackoverflow.com/a/47541882
@@ -110,18 +101,29 @@ valid_force_levels=("prerelease" "patch" "minor" "major")
 if [ -z "$INPUT_FORCE" ]; then
 	true # do nothing if 'force' input is not set
 elif printf '%s\0' "${valid_force_levels[@]}" | grep -Fxzq "$INPUT_FORCE"; then
-	ARGS+=("--$INPUT_FORCE")
+	VERSION_SHAPE_ARGS+=("--$INPUT_FORCE")
 else
 	printf "Error: Input 'force' must be one of: %s\n" "${valid_force_levels[@]}" >&2
+	exit 1
 fi
 
 if [ -n "$INPUT_BUILD_METADATA" ]; then
-	ARGS+=("--build-metadata $INPUT_BUILD_METADATA")
+	VERSION_SHAPE_ARGS+=("--build-metadata $INPUT_BUILD_METADATA")
 fi
 
 if [ -n "$INPUT_PRERELEASE_TOKEN" ]; then
-	ARGS+=("--prerelease-token $INPUT_PRERELEASE_TOKEN")
+	VERSION_SHAPE_ARGS+=("--prerelease-token $INPUT_PRERELEASE_TOKEN")
 fi
+
+# Side-effect flags. Only pass 2 should commit/tag/push/changelog/build/release;
+# pass 1 is always invoked with these side-effects forced off.
+ARGS=()
+ARGS+=("$(eval_boolean_action_input "commit" "$INPUT_COMMIT" "--commit" "--no-commit")") || exit 1
+ARGS+=("$(eval_boolean_action_input "tag" "$INPUT_TAG" "--tag" "--no-tag")") || exit 1
+ARGS+=("$(eval_boolean_action_input "push" "$INPUT_PUSH" "--push" "--no-push")") || exit 1
+ARGS+=("$(eval_boolean_action_input "changelog" "$INPUT_CHANGELOG" "--changelog" "--no-changelog")") || exit 1
+ARGS+=("$(eval_boolean_action_input "vcs_release" "$INPUT_VCS_RELEASE" "--vcs-release" "--no-vcs-release")") || exit 1
+ARGS+=("$(eval_boolean_action_input "build" "$INPUT_BUILD" "" "--skip-build")") || exit 1
 
 # Change to configured directory
 cd "${INPUT_DIRECTORY}"
@@ -140,7 +142,7 @@ fi
 
 # See https://github.com/actions/runner-images/issues/6775#issuecomment-1409268124
 # and https://github.com/actions/runner-images/issues/6775#issuecomment-1410270956
-git config --system --add safe.directory "*"
+git config --global --add safe.directory "$WORKSPACE_DIR"
 
 if [[ -n "$INPUT_SSH_PUBLIC_SIGNING_KEY" && -n "$INPUT_SSH_PRIVATE_SIGNING_KEY" ]]; then
 	echo "SSH Key pair found, configuring signing..."
@@ -179,11 +181,21 @@ fi
 export GH_TOKEN="${INPUT_GITHUB_TOKEN}"
 
 # normalize extra spaces into single spaces as you combine the arguments
-CMD_ARGS="$(printf '%s' "${ROOT_OPTIONS[*]} version ${ARGS[*]}" | sed 's/  [ ]*/ /g' | sed 's/^ *//g')"
+CMD_ARGS="$(printf '%s' "${ROOT_OPTIONS[*]} version ${ARGS[*]} ${VERSION_SHAPE_ARGS[*]}" | sed 's/  [ ]*/ /g' | sed 's/^ *//g')"
 
-# Make sure the workspace directory is owned by the external filesystem UID/GID no matter what
-# This is to ensure that after the action, and a commit was created, the files are owned by the external filesystem
-trap "chown -R $EXT_HOST_UID:$EXT_HOST_GID '$WORKSPACE_DIR'" EXIT
+# When the project uses uv, refresh uv.lock against the new version and stage
+# it so psr's release commit includes it. We achieve this via a two-pass
+# invocation: pass 1 only rewrites the version files, pass 2 performs the
+# real release and picks up the staged uv.lock.
+if [ -f uv.lock ] && [ "${INPUT_NO_OPERATION_MODE}" != "true" ]; then
+	PASS1_ARGS="$(printf '%s' "${ROOT_OPTIONS[*]} version --no-commit --no-tag --no-push --no-vcs-release --no-changelog --skip-build ${VERSION_SHAPE_ARGS[*]}" | sed 's/  [ ]*/ /g' | sed 's/^ *//g')"
 
-# Run Semantic Release (explicitly use the GitHub action version)
-explicit_run_cmd "$PSR_VENV_BIN/semantic-release $CMD_ARGS"
+	# Suppress GITHUB_OUTPUT writes during pass 1 so only pass 2 produces the
+	# action's output values.
+	GITHUB_OUTPUT=/dev/null "${PSR_UVX[@]}" $PASS1_ARGS
+
+	uv lock
+	git add uv.lock
+fi
+
+"${PSR_UVX[@]}" $CMD_ARGS
