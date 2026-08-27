@@ -29,7 +29,7 @@ authors = [
 dependencies = [
   "click ~= 8.1.0",
   "click-option-group ~= 0.5",
-  "gitpython ~= 3.0",
+  "gitpython < 3.1.60",
   "requests ~= 2.25",
   "jinja2 ~= 3.1",
   "python-gitlab >= 4.0.0, < 7.0.0",
