@@ -57,7 +57,7 @@ if ! command -v uv >/dev/null 2>&1; then
 	exit 1
 fi
 
-PSR_UVX=(uvx --from "python-semantic-release==10.5.3" semantic-release)
+PSR_UVX=(uvx --from "python-semantic-release==10.5.3" --with "gitpython<3.1.60" semantic-release)
 
 # Convert inputs to command line arguments
 ROOT_OPTIONS=()
